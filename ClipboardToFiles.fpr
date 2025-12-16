@@ -1,0 +1,200 @@
+program clipboardtofiles;
+
+{$mode delphi}
+
+uses windows, sysutils, shellapi, classes;
+
+type
+
+  TFilePaths = array of string;
+
+function ParseTextPaths(const text: string): TFilePaths;
+var
+  lines: TStringList;
+  i, validCount: Integer;
+  path: string;
+begin
+  SetLength(Result, 0);
+  lines := TStringList.Create;
+  try
+    lines.Text := text;
+    validCount := 0;
+    
+    for i := 0 to lines.Count - 1 do begin
+      path := Trim(lines[i]);
+      if (path <> '') and (FileExists(path) or DirectoryExists(path)) then begin
+        SetLength(Result, validCount + 1);
+        Result[validCount] := path;
+        Inc(validCount);
+      end;
+    end;
+  finally
+    lines.Free;
+  end;
+end;
+
+function ClipboardFiles: TFilePaths;
+var
+  h: THandle;
+  filesCount: Integer;
+  buffer: Array [0..MAX_PATH] of Char;
+  textBuffer: PChar;
+  textSize: Integer;
+  clipText: string;
+  i: Integer;
+begin
+  SetLength(Result, 0);
+  OpenClipboard(0);
+  try
+    h := GetClipboardData(CF_HDROP);
+    if h <> 0 then begin
+      filesCount := DragQueryFile(h, $FFFFFFFF, Nil, 0);
+      if filesCount > 0 then begin
+        SetLength(Result, filesCount);
+        for i := 0 to filesCount - 1 do begin
+          DragQueryFile(h, i, buffer, sizeof(buffer));
+          Result[i] := String(buffer);
+        end;
+      end;
+    end else begin
+      h := GetClipboardData(CF_TEXT);
+      if h <> 0 then begin
+        textBuffer := GlobalLock(h);
+        if textBuffer <> nil then begin
+          try
+            clipText := StrPas(textBuffer);
+            Result := ParseTextPaths(clipText);
+          finally
+            GlobalUnlock(h);
+          end;
+        end;
+      end;
+    end;
+  finally
+    CloseClipboard();
+  end;
+end;
+
+function GetUniqueDestName(const baseName: string): string;
+var
+  counter: Integer;
+  nameOnly, ext: string;
+begin
+  Result := baseName;
+  
+  if not FileExists(Result) and not DirectoryExists(Result) then
+    Exit;
+    
+  nameOnly := ChangeFileExt(baseName, '');
+  ext := ExtractFileExt(baseName);
+  counter := 1;
+  
+  repeat
+    Result := nameOnly + ' (' + IntToStr(counter) + ')' + ext;
+    Inc(counter);
+  until not FileExists(Result) and not DirectoryExists(Result);
+end;
+
+function CopyFileOrFolder(const source: string; forceOverwrite: Boolean; autoRename: Boolean; out errorMsg: string): Boolean;
+var
+  sourceAttr: DWORD;
+  destName: string;
+  shFileOp: TSHFileOpStruct;
+  sourceBuffer: array[0..MAX_PATH+1] of Char;
+  destBuffer: array[0..MAX_PATH+1] of Char;
+  isDirectory: Boolean;
+  itemType: string;
+begin
+  Result := False;
+  errorMsg := '';
+  
+  if Trim(source) = '' then begin
+    errorMsg := 'Empty path: "' + source + '"';
+    Exit;
+  end;
+    
+  if not FileExists(source) and not DirectoryExists(source) then begin
+    errorMsg := 'Path does not exist: "' + source + '"';
+    Exit;
+  end;
+    
+  sourceAttr := GetFileAttributes(PChar(source));
+  if sourceAttr = INVALID_FILE_ATTRIBUTES then begin
+    errorMsg := 'Cannot get attributes for: "' + source + '"';
+    Exit;
+  end;
+  
+  isDirectory := (sourceAttr and FILE_ATTRIBUTE_DIRECTORY) <> 0;
+  if isDirectory then
+    itemType := 'folder'
+  else
+    itemType := 'file';
+    
+  destName := ExtractFileName(source);
+  if destName = '' then begin
+    errorMsg := 'Cannot extract name from ' + itemType + ': "' + source + '"';
+    Exit;
+  end;
+    
+  if FileExists(destName) or DirectoryExists(destName) then begin
+    if autoRename then begin
+      destName := GetUniqueDestName(destName);
+    end else if not forceOverwrite then begin
+      errorMsg := 'Destination ' + itemType + ' already exists: "' + destName + '" (use /force to overwrite or /rename for auto-rename)';
+      Exit;
+    end;
+  end;
+  
+  if isDirectory then begin
+    FillChar(sourceBuffer, SizeOf(sourceBuffer), 0);
+    FillChar(destBuffer, SizeOf(destBuffer), 0);
+    StrPCopy(sourceBuffer, source + #0);
+    StrPCopy(destBuffer, destName + #0);
+    
+    FillChar(shFileOp, SizeOf(shFileOp), 0);
+    shFileOp.wFunc := FO_COPY;
+    shFileOp.pFrom := sourceBuffer;
+    shFileOp.pTo := destBuffer;
+    shFileOp.fFlags := FOF_SILENT or FOF_NOCONFIRMATION or FOF_NOERRORUI or FOF_NOCOPYSECURITYATTRIBS;
+    
+    if SHFileOperation(shFileOp) = 0 then
+      Result := True
+    else
+      errorMsg := 'Failed to copy folder: "' + source + '" to "' + destName + '"';
+  end else if (sourceAttr and (FILE_ATTRIBUTE_DEVICE or FILE_ATTRIBUTE_REPARSE_POINT or FILE_ATTRIBUTE_SYSTEM)) = 0 then begin
+    if CopyFile(PChar(source), PChar(destName), not forceOverwrite) then
+      Result := True
+    else
+      errorMsg := 'Failed to copy file: "' + source + '" to "' + destName + '"';
+  end else begin
+    errorMsg := 'Unsupported file type: "' + source + '" (system/device/reparse point)';
+  end;
+end;
+
+var
+  i: Integer;
+  filepaths: TFilePaths;
+  errorMsg: string;
+  forceOverwrite: Boolean;
+  autoRename: Boolean;
+begin
+  forceOverwrite := False;
+  autoRename := False;
+  
+  for i := 1 to ParamCount do begin
+    if (ParamStr(i) = '/force') or (ParamStr(i) = '/f') then
+      forceOverwrite := True
+    else if (ParamStr(i) = '/rename') or (ParamStr(i) = '/r') then
+      autoRename := True;
+  end;
+  
+  filepaths := ClipboardFiles;
+  if Length(filepaths) > 0 then begin
+    for i := 0 to High(filepaths) do begin
+      if CopyFileOrFolder(filepaths[i], forceOverwrite, autoRename, errorMsg) then
+        Writeln(filepaths[i])
+      else
+        Writeln(ErrOutput, 'Error copying "' + filepaths[i] + '": ' + errorMsg);
+    end;
+  end;
+end.
